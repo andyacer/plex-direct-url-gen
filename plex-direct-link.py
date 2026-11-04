@@ -14,6 +14,8 @@ Usage examples:
 """
 
 import argparse
+import html
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -32,12 +34,52 @@ def read_xml(source, clipboard):
     return sys.stdin.read()
 
 
+AMP_FIX = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
+ATTR = re.compile(r'([\w:.-]+)\s*=\s*"([^"]*)"')
+
+
+def parse_parts_regex(text):
+    """Fallback for XML that won't parse: scan for <Part ...> tags directly."""
+    parts = []
+    for m in re.finditer(r"<Part\b[^>]*>", text):
+        attrs = {k: html.unescape(v) for k, v in ATTR.findall(m.group(0))}
+        if not attrs.get("key"):
+            continue
+        # Nearest preceding Video/Track tag supplies the title.
+        title = "Untitled"
+        for v in re.finditer(r"<(?:Video|Track)\b[^>]*>", text[: m.start()]):
+            t = dict(ATTR.findall(v.group(0))).get("title")
+            if t:
+                title = html.unescape(t)
+        parts.append({
+            "title": title,
+            "key": attrs["key"],
+            "file": attrs.get("file", ""),
+            "desc": attrs.get("container", ""),
+            "size": attrs.get("size"),
+        })
+    if not parts:
+        raise ValueError("No <Part key=...> found in the XML, even with the fallback scan. "
+                         "Make sure you copied the XML for the movie/episode itself.")
+    return parts
+
+
 def parse_parts(xml_text):
     """Return a list of dicts, one per Media/Part in the XML."""
     start = xml_text.find("<")
     if start == -1:
         raise ValueError("No XML found in the input.")
-    root = ET.fromstring(xml_text[start:].strip())
+    text = xml_text[start:].strip()
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        try:
+            # Common cause: bare & in a title or filename.
+            root = ET.fromstring(AMP_FIX.sub("&amp;", text))
+        except ET.ParseError as e:
+            print(f"Warning: XML is malformed ({e}); falling back to regex scan.", file=sys.stderr)
+            return parse_parts_regex(text)
 
     parts = []
     for item in root.iter():
